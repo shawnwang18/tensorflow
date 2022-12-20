@@ -28,6 +28,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
 #include "tensorflow/compiler/xla/service/hlo_creation_utils.h"
+#include "tensorflow/compiler/xla/service/hlo_reachability.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/tsl/platform/errors.h"
 
@@ -55,7 +56,9 @@ class HorizontalLoopFusionImpl {
  public:
   explicit HorizontalLoopFusionImpl(HloComputation* computation,
                                     absl::string_view prefix)
-      : computation_(computation), prefix_(prefix) {}
+      : computation_(computation), prefix_(prefix) {
+      reachability_ = HloReachabilityMap::Build(computation_);
+  }
 
   ~HorizontalLoopFusionImpl() {}
 
@@ -101,7 +104,7 @@ class HorizontalLoopFusionImpl {
     }
 
     // Gets a span of fusions to be fused.
-    absl::Span<HloInstruction*> GetNextSpanOfFusions();
+    absl::Span<HloInstruction*> GetNextSpanOfFusions(HloReachabilityMap *reachability_map);
 
    private:
     void Initialize(HloInstruction*);
@@ -116,15 +119,11 @@ class HorizontalLoopFusionImpl {
 
   HloComputation* computation_;
   std::string prefix_;
+  // The reachability map of current computation
+  std::unique_ptr<HloReachabilityMap> reachability_;
 };  // HorizontalLoopFusionImpl
 
 bool IsFusibleCandidate(const HloInstruction& instr) {
-  // For now, we do not support fusing instruction with control flow.
-  if (!instr.control_successors().empty() ||
-      !instr.control_predecessors().empty()) {
-    return false;
-  }
-
   // Require no further check for element-wise instructions.
   if (instr.IsElementwise() && instr.operand_count() > 0) {
     return true;
@@ -308,7 +307,7 @@ void HorizontalLoopFusionImpl::FusionCandidates::Initialize(
 
 // Gets a next span of fusion instructions to be fused.
 absl::Span<HloInstruction*> 
-HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
+HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions(HloReachabilityMap *reachability_map) {
   if (pos_ >= fusible_instrs_.size()) {
     return absl::Span<HloInstruction*>();
   }
@@ -366,6 +365,22 @@ HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
   size_t first_output_size = GetOutputSizeOfFusible(*fusible_instrs_[left]);
   PrimitiveType first_output_type =
       GetUniqueOutputTypeOfFusible(*fusible_instrs_[left]);
+
+  // Check whether the next operand instruction is reachable to previous fused operand, 
+  // if so, fusing them will create cycle in the fused graph. 
+  auto IncludingRightWillCreateCycle = [&, this]() -> bool {
+    if ((right - left) > 1) {
+      for (std::vector<HloInstruction*>::const_iterator iter = fusible_instrs_.begin() + left; 
+           iter < fusible_instrs_.begin() + right; 
+           iter++) {
+        if (reachability_map->IsConnected(*iter, fusible_instrs_[right])) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   for (; right < fusible_instrs_.size(); ++right) {
     PrimitiveType cur_output_type =
         GetUniqueOutputTypeOfFusible(*fusible_instrs_[right]);
@@ -393,6 +408,9 @@ HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
     } else if (reach_max_fusion_batch_size(left, right)) {
       // Hit max fusion batch size.
       break;
+    } else if (IncludingRightWillCreateCycle()) {
+      // Including the right operand will introduce cycle in the fused graph
+      break;
     }
   }
   VLOG(2) << "horizontal fuse get instruction span with " << (right - left) 
@@ -408,7 +426,7 @@ StatusOr<bool> HorizontalLoopFusionImpl::FuseConsumerOperands(
   bool changed = false;
   FusionCandidates loop_fusion_candidates(consumer, sliced_input_fusion);
   while (true) {
-    auto fusibles = loop_fusion_candidates.GetNextSpanOfFusions();
+    auto fusibles = loop_fusion_candidates.GetNextSpanOfFusions(reachability_.get());
     if (fusibles.empty()) {
       break;
     } else if (fusibles.size() == 1) {
@@ -417,21 +435,8 @@ StatusOr<bool> HorizontalLoopFusionImpl::FuseConsumerOperands(
     }
 
     changed = true;
-    // Convert fusible into fusion_instrs to simplify the implementation of
-    // `Fuse()`.
-    std::vector<HloInstruction*> fusion_instrs;
-    for (HloInstruction* instr : fusibles) {
-      if (instr->opcode() == HloOpcode::kFusion) {
-        fusion_instrs.push_back(instr);
-      } else {
-        TF_ASSIGN_OR_RETURN(
-            HloInstruction * fusion_instr,
-            MakeFusionInstruction(instr, HloInstruction::FusionKind::kLoop));
-        fusion_instrs.push_back(fusion_instr);
-      }
-    }
 
-    TF_RETURN_IF_ERROR(Fuse(absl::MakeSpan(fusion_instrs), sliced_input_fusion, to_fuse_candidates));
+    TF_RETURN_IF_ERROR(Fuse(fusibles, sliced_input_fusion, to_fuse_candidates));
   }
   return changed;
 }
@@ -590,12 +595,25 @@ Status HorizontalLoopFusionImpl::CreateFusedComputation(
 Status HorizontalLoopFusionImpl::Fuse(
     absl::Span<HloInstruction*> fused_fusion_instrs, bool sliced_input_fusion,
     std::vector<HloInstruction*>& to_fuse_candidates) {
-  // Fuse fused_fusion_instrs and replace them with the new fused computation.
+  // Convert fusible into fusion_instrs to simplify the implementation
+  std::vector<HloInstruction*> fusion_instrs;
+  for (HloInstruction* instr : fused_fusion_instrs) {
+    if (instr->opcode() == HloOpcode::kFusion) {
+      fusion_instrs.push_back(instr);
+    } else {
+      TF_ASSIGN_OR_RETURN(
+          HloInstruction * fusion_instr,
+          MakeFusionInstruction(instr, HloInstruction::FusionKind::kLoop));
+      fusion_instrs.push_back(fusion_instr);
+    }
+  }
+
+  // Fuse fusion_instrs and replace them with the new fused computation.
   std::unique_ptr<HloComputation> uniq_computation;
   std::vector<HloInstruction*> bound_operands;
 
   TF_RETURN_IF_ERROR(CreateFusedComputation(
-      fused_fusion_instrs, &uniq_computation, &bound_operands, sliced_input_fusion));
+      absl::MakeSpan(fusion_instrs), &uniq_computation, &bound_operands, sliced_input_fusion));
 
   HloComputation* fused_comp = computation_->parent()->AddEmbeddedComputation(
       std::move(uniq_computation));
@@ -608,7 +626,7 @@ Status HorizontalLoopFusionImpl::Fuse(
   fused_comp->SetFusionInstruction(hori_fusion_instr);
 
   // we push the newly fused instruction into fusion candidate stack, because the operands
-  // of the newly fused instruction could now be possible to be horizontally fused. 
+  // of the newly fused instruction could now be possible to be further horizontally fused. 
   to_fuse_candidates.push_back(hori_fusion_instr);
 
   // Insert bitcasts and replace corresponding users. Note that we do not insert
@@ -616,9 +634,9 @@ Status HorizontalLoopFusionImpl::Fuse(
   // input fusion pattern. However, inserting bitcasts outside the fused
   // computation creates no performance cost.
   size_t total_output_id = 0;
-  for (size_t i = 0; i < fused_fusion_instrs.size(); ++i) {
+  for (size_t i = 0; i < fusion_instrs.size(); ++i) {
     std::vector<HloInstruction*> bitcasts_or_gte;
-    HloInstruction* fused_instr = fused_fusion_instrs[i];
+    HloInstruction* fused_instr = fusion_instrs[i];
     size_t num_outputs = GetOutputSizeOfFusible(*fused_instr);
     for (size_t j = 0; j < num_outputs; ++j) {
       const HloInstruction* output = GetOutputsOfFusible(*fused_instr)[j];
@@ -637,18 +655,30 @@ Status HorizontalLoopFusionImpl::Fuse(
         (bitcasts_or_gte.size() == 1)
             ? bitcasts_or_gte.at(0)
             : computation_->AddInstruction(
-                  HloInstruction::CreateTuple(bitcasts_or_gte));
+                    HloInstruction::CreateTuple(bitcasts_or_gte));
     HloComputation* old_computation =
         fused_instr->fused_instructions_computation();
     HloModule* module = old_computation->parent();
     TF_RETURN_IF_ERROR(
         computation_->ReplaceInstruction(fused_instr, bitcast_or_tuple));
     TF_RETURN_IF_ERROR(module->RemoveEmbeddedComputation(old_computation));
+
+    // Redirect control dependency predecessors to the hori_fusion_instr
+    for (auto instr : fused_fusion_instrs[i]->control_predecessors()) {
+      TF_RETURN_IF_ERROR(fused_fusion_instrs[i]->RemoveControlDependencyTo(instr));
+      TF_RETURN_IF_ERROR(hori_fusion_instr->AddControlDependencyTo(instr));
+    }
+
+    // Redirect control dependency successors to bitcast_or_tuple
+    for (auto instr : fused_fusion_instrs[i]->control_successors()) {
+      TF_RETURN_IF_ERROR(instr->RemoveControlDependencyTo(fused_fusion_instrs[i]));
+      TF_RETURN_IF_ERROR(instr->AddControlDependencyTo(bitcast_or_tuple));
+    }
   }
 
   TF_RETURN_IF_ERROR(Cast<HloFusionInstruction>(hori_fusion_instr)
                          ->DeduplicateFusionOperands());
-
+  reachability_->UpdateReachabilityThroughInstruction(hori_fusion_instr);
   VLOG(1) << "Fused " << fused_fusion_instrs.size()
           << " instructions into: " << hori_fusion_instr->ToString();
   return OkStatus();
