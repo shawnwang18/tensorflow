@@ -706,9 +706,11 @@ StatusOr<bool> GpuHorizontalLoopFusion::Run(
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   VLOG(2) << "Run horizontal fusion.";
 
-  // Run on the entry computation is actually enough.
-  TF_ASSIGN_OR_RETURN(bool changed, RunOnComputation(module->entry_computation()));
-
+  bool changed = false;
+  for (auto comp : module->MakeNonfusionComputations()) {
+    TF_ASSIGN_OR_RETURN(bool comp_changed, RunOnComputation(comp));
+    changed |= comp_changed;
+  }
   return changed;
 }
 
