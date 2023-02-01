@@ -707,10 +707,7 @@ StatusOr<bool> GpuHorizontalLoopFusion::Run(
   VLOG(2) << "Run horizontal fusion.";
 
   bool changed = false;
-  for (auto comp : module->MakeNonfusionComputations()) {
-    TF_ASSIGN_OR_RETURN(bool comp_changed, RunOnComputation(comp));
-    changed |= comp_changed;
-  }
+  TF_ASSIGN_OR_RETURN(changed, RunOnComputation(module->entry_computation()));
   return changed;
 }
 
